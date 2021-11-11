@@ -144,7 +144,7 @@ func (this *YClient) RequestTimeout(timeout time.Duration, method string, args .
 
 	start_time := time.Now()
 
-	res, consume, err := this.rpc.Request(timeout, method, params)
+	res, consume, err := this.rpc.Request(time.Duration(timeout)*time.Second, method, params)
 
 	consume_t := int(time.Now().Sub(start_time).Nanoseconds() / 1000 / 1000)
 	delete(params, "secret")

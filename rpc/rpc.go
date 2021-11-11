@@ -6,6 +6,7 @@ import (
 	pb "github.com/mlaoji/yclient/pb"
 	"golang.org/x/net/context"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/metadata"
 	"sync"
 	"time"
 )
@@ -193,7 +194,11 @@ func (c *RpcClient) Request(timeout time.Duration, method string, params map[str
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	r, err := c.client.Call(ctx, &pb.Request{Method: method, Params: params})
+	md := metadata.Pairs("appid", params["appid"], "secret", params["secret"])
+	ctx = metadata.NewOutgoingContext(ctx, md)
+
+	var header, trailer metadata.MD
+	r, err := c.client.Call(ctx, &pb.Request{Method: method, Params: params}, grpc.Header(&header), grpc.Trailer(&trailer))
 
 	if err != nil {
 		c.rpcFail = true
