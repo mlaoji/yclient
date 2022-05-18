@@ -1,10 +1,10 @@
 package rpc
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
-	pb "github.com/mlaoji/yclient/pb"
-	"golang.org/x/net/context"
+	"github.com/mlaoji/ygo/x/pb"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/metadata"
 	"sync"
@@ -15,11 +15,17 @@ type RpcPool struct {
 	Addr         string
 	pool         chan *RpcClient
 	df           DialFunc
-	timeout      time.Duration
-	maxIdleConns int
-	maxOpenConns int
 	connRequests int
 	lock         sync.RWMutex
+	options      *RpcOptions
+}
+
+type RpcOptions struct {
+	Timeout      time.Duration
+	MaxIdleConns int
+	MaxOpenConns int
+	Headers      map[string]string
+	Ctx          context.Context
 }
 
 var (
@@ -28,24 +34,25 @@ var (
 
 type DialFunc func(addr string, timout time.Duration) (*RpcClient, error)
 
-func NewRpcPool(addr string, timeout time.Duration, maxIdleConns, maxOpenConns int, df DialFunc) (*RpcPool, error) {
+func NewRpcPool(addr string, df DialFunc, options *RpcOptions) (*RpcPool, error) { // {{{
 	var client *RpcClient
 	var err error
-	if maxIdleConns <= 0 {
-		maxIdleConns = 1
+
+	if options.MaxIdleConns <= 0 {
+		options.MaxIdleConns = 1
 	}
 
-	if maxOpenConns <= 0 {
-		maxOpenConns = 1
+	if options.MaxOpenConns <= 0 {
+		options.MaxOpenConns = 1
 	}
 
-	if maxIdleConns > maxOpenConns {
-		maxIdleConns = maxOpenConns
+	if options.MaxIdleConns > options.MaxOpenConns {
+		options.MaxIdleConns = options.MaxOpenConns
 	}
 
-	pool := make([]*RpcClient, 0, maxIdleConns)
-	for i := 0; i < maxIdleConns; i++ {
-		client, err = df(addr, timeout)
+	pool := make([]*RpcClient, 0, options.MaxIdleConns)
+	for i := 0; i < options.MaxIdleConns; i++ {
+		client, err = df(addr, options.Timeout)
 		if err != nil {
 			for _, client = range pool {
 				client.Close()
@@ -56,34 +63,32 @@ func NewRpcPool(addr string, timeout time.Duration, maxIdleConns, maxOpenConns i
 		pool = append(pool, client)
 	}
 	p := RpcPool{
-		Addr:         addr,
-		pool:         make(chan *RpcClient, maxOpenConns),
-		df:           df,
-		timeout:      timeout,
-		maxIdleConns: maxIdleConns,
-		maxOpenConns: maxOpenConns,
+		Addr:    addr,
+		pool:    make(chan *RpcClient, options.MaxOpenConns),
+		df:      df,
+		options: options,
 	}
 	for i := range pool {
 		p.pool <- pool[i]
 	}
 	return &p, err
-}
+} // }}}
 
-func New(addr string, timeout time.Duration, maxIdleConns, maxOpenConns int) (*RpcPool, error) {
-	return NewRpcPool(addr, timeout, maxIdleConns, maxOpenConns, DialGrpc)
+func New(addr string, options *RpcOptions) (*RpcPool, error) {
+	return NewRpcPool(addr, DialGrpc, options)
 }
 
 //从连接池中取已建立的连接，不存在则创建
-func (p *RpcPool) Get() (*RpcClient, error) {
+func (p *RpcPool) Get() (*RpcClient, error) { // {{{
 	Println("get ==== > Requests :", p.connRequests, "PoolSize:", cap(p.pool), " Avail:", len(p.pool))
 	p.lock.Lock()
 	p.connRequests++
-	if p.connRequests > p.maxOpenConns {
+	if p.connRequests > p.options.MaxOpenConns {
 		p.lock.Unlock()
 		Println("wait...")
 		select {
 		case <-time.After(3 * time.Second):
-			return nil, Errorf(ERRNO_UNKNOWN, "pool is full")
+			return nil, fmt.Errorf("pool is full")
 		case conn := <-p.pool:
 			return conn, nil
 		}
@@ -91,21 +96,21 @@ func (p *RpcPool) Get() (*RpcClient, error) {
 		p.lock.Unlock()
 		select {
 		case <-time.After(3 * time.Second):
-			return nil, Errorf(ERRNO_UNKNOWN, "pool is full")
+			return nil, fmt.Errorf("pool is full")
 		case conn := <-p.pool:
 			return conn, nil
 		default:
 			Println("gen a new conn")
-			return p.df(p.Addr, p.timeout)
+			return p.df(p.Addr, p.options.Timeout)
 		}
 	}
-}
+} // }}}
 
 //将连接放回池子
-func (p *RpcPool) Put(conn *RpcClient) {
+func (p *RpcPool) Put(conn *RpcClient) { // {{{
 	p.lock.RLock()
 	//当前可用连接数大于最大空闲数则直接抛弃
-	if len(p.pool) >= p.maxIdleConns {
+	if len(p.pool) >= p.options.MaxIdleConns {
 		p.lock.RUnlock()
 		conn.Close()
 	} else {
@@ -118,7 +123,7 @@ func (p *RpcPool) Put(conn *RpcClient) {
 				conn.Close()
 			}
 		} else {
-			Errorf(ERRNO_UNKNOWN, "rpcClient is error")
+			fmt.Errorf("rpcClient error")
 			conn.Close()
 		}
 	}
@@ -128,26 +133,20 @@ func (p *RpcPool) Put(conn *RpcClient) {
 	p.lock.Unlock()
 
 	Println("put ==== > Requests :", p.connRequests, "PoolSize:", cap(p.pool), " Avail:", len(p.pool))
-}
+} // }}}
 
-func (p *RpcPool) Request(timeout time.Duration, method string, params map[string]string) (map[string]interface{}, int, error) {
+func (p *RpcPool) Request(method string, params map[string]string, options *RpcOptions) (map[string]interface{}, metadata.MD, metadata.MD, error) { // {{{
 	c, err := p.Get()
 	if err != nil {
-		return nil, 0, err
+		return nil, nil, nil, err
 	}
 	defer p.Put(c)
 
-	if timeout <= 0 {
-		timeout = p.timeout
-	}
-
-	data, consume, errs := c.Request(timeout, method, params)
-
-	return data, consume, errs
-}
+	return c.Request(method, params, options)
+} // }}}
 
 //清空池子并关闭连接
-func (p *RpcPool) Empty() {
+func (p *RpcPool) Empty() { // {{{
 	var conn *RpcClient
 	for {
 		select {
@@ -157,7 +156,7 @@ func (p *RpcPool) Empty() {
 			return
 		}
 	}
-}
+} // }}}
 
 type RpcClient struct {
 	Address string
@@ -172,7 +171,7 @@ const (
 	ERRNO_UNKNOWN
 )
 
-func DialGrpc(addr string, timeout time.Duration) (*RpcClient, error) {
+func DialGrpc(addr string, timeout time.Duration) (*RpcClient, error) { // {{{
 	conn, err := grpc.Dial(addr, grpc.WithInsecure(), grpc.WithTimeout(timeout))
 	if err != nil {
 		return nil, err
@@ -183,128 +182,66 @@ func DialGrpc(addr string, timeout time.Duration) (*RpcClient, error) {
 		client:  pb.NewYGOServiceClient(conn),
 		conn:    conn,
 	}, nil
-}
+} // }}}
 
 func (c *RpcClient) Close() error {
 	return c.conn.Close()
 }
 
-//Request {{{
-func (c *RpcClient) Request(timeout time.Duration, method string, params map[string]string) (map[string]interface{}, int, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
+func (c *RpcClient) Request(method string, params map[string]string, options *RpcOptions) (map[string]interface{}, metadata.MD, metadata.MD, error) { //{{{
+	if options.Ctx == nil {
+		options.Ctx = context.Background()
+	}
 
-	md := metadata.Pairs("appid", params["appid"], "secret", params["secret"])
-	ctx = metadata.NewOutgoingContext(ctx, md)
+	if options.Timeout > 0 {
+		var cancel context.CancelFunc
+		options.Ctx, cancel = context.WithTimeout(options.Ctx, options.Timeout)
+		defer cancel()
+	}
+
+	if len(options.Headers) > 0 {
+		md := metadata.MD{}
+		for k, v := range options.Headers {
+			md.Append(k, v)
+		}
+
+		options.Ctx = metadata.NewOutgoingContext(options.Ctx, md)
+	}
 
 	var header, trailer metadata.MD
-	r, err := c.client.Call(ctx, &pb.Request{Method: method, Params: params}, grpc.Header(&header), grpc.Trailer(&trailer))
+	r, err := c.client.Call(options.Ctx, &pb.Request{Method: method, Params: params}, grpc.Header(&header), grpc.Trailer(&trailer))
 
 	if err != nil {
 		c.rpcFail = true
-		return nil, 0, Errorf(ERRNO_GRPC, "%v", err)
+		return nil, nil, nil, fmt.Errorf("grpc call error: %+v", err)
 	}
 
-	return c.process(r.Response)
+	data, err := c.process(r.Response)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	return data, header, trailer, nil
 } // }}}
 
-//process {{{
-func (c *RpcClient) process(res string) (map[string]interface{}, int, error) {
-	if res == "" {
-		return nil, 0, Errorf(ERRNO_UNKNOWN, "response is empty")
+func (c *RpcClient) process(res []byte) (map[string]interface{}, error) { //{{{
+	if res == nil {
+		return nil, fmt.Errorf("response is empty")
 	}
 
 	var ret = make(map[string]interface{}, 0)
-	err := json.Unmarshal([]byte(res), &ret)
-
+	err := json.Unmarshal(res, &ret)
 	if err != nil {
-		return nil, 0, Errorf(ERRNO_UNKNOWN, "%v", err)
+		return nil, fmt.Errorf("result parse error: %+v", err)
 	}
 
-	if nil == ret["code"] {
-		return nil, 0, Errorf(ERRNO_UNKNOWN, "data format error")
-	}
-
-	if 0 == ret["code"].(float64) {
-		if nil == ret["data"] {
-			return nil, 0, Errorf(ERRNO_UNKNOWN, "data format error")
-		}
-
-		data := c.convertFloat(ret["data"])
-		value, ok := data.(map[string]interface{})
-		if !ok {
-			return nil, 0, Errorf(ERRNO_UNKNOWN, "response data format need map[string]interface{}")
-		}
-		return value, int(ret["consume"].(float64)), nil
-	}
-
-	return nil, int(ret["consume"].(float64)), Errorf(int(ret["code"].(float64)), ret["msg"].(string))
+	return ret, nil
 } // }}}
 
-func (c *RpcClient) convertFloat(r interface{}) interface{} { // {{{
-	switch val := r.(type) {
-	case map[string]interface{}:
-		s := map[string]interface{}{}
-		for k, v := range val {
-			s[k] = c.convertFloat(v)
-		}
-		return s
-	case []interface{}:
-		s := []interface{}{}
-		for _, v := range val {
-			s = append(s, c.convertFloat(v))
-		}
-		return s
-	case float64:
-		return int(val)
-	default:
-		return r
-	}
-} // }}}
-
-type rpcError struct {
-	code int
-	msg  string
-}
-
-func (e *rpcError) Error() string {
-	return e.msg
-}
-
-func Code(err error) int {
-	if err == nil {
-		return ERRNO_OK
-	}
-	if e, ok := err.(*rpcError); ok {
-		return e.code
-	}
-	return ERRNO_UNKNOWN
-}
-
-func Msg(err error) string {
-	if err == nil {
-		return ""
-	}
-	if e, ok := err.(*rpcError); ok {
-		return e.msg
-	}
-	return err.Error()
-}
-
-func Errorf(code int, format string, a ...interface{}) error {
-	if code == ERRNO_OK {
-		return nil
-	}
-	return &rpcError{
-		code: code,
-		msg:  fmt.Sprintf(format, a...),
-	}
-}
-
-func Println(a ...interface{}) (n int, err error) {
+func Println(a ...interface{}) (n int, err error) { // {{{
 	if Debug {
 		return fmt.Println(a...)
 	}
 
 	return
-}
+} // }}}

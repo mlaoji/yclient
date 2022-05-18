@@ -13,19 +13,18 @@ import (
 	"time"
 )
 
-func PreParams(params map[string]string, obj interface{}) (data map[string]string, err error) { // {{{
+func PreParams(obj interface{}) (data map[string]string, err error) { // {{{
 	data = make(map[string]string)
-	if nil != params {
-		data = params
-	}
 
 	objVal := reflect.ValueOf(obj)
+	kind := objVal.Kind()
 
-	if objVal.Kind() == reflect.Ptr {
+	if kind == reflect.Ptr {
 		objVal = objVal.Elem()
+		kind = objVal.Kind()
 	}
 
-	switch objVal.Kind() {
+	switch kind {
 	case reflect.Map:
 		keys := objVal.MapKeys()
 		for _, k := range keys {
@@ -34,7 +33,7 @@ func PreParams(params map[string]string, obj interface{}) (data map[string]strin
 	case reflect.Struct:
 		t := objVal.Type()
 		for i := 0; i < t.NumField(); i++ {
-			tag := t.Field(i).Tag.Get("yc")
+			tag := t.Field(i).Tag.Get("json")
 			if tag == "-" || tag == "nil" {
 				continue
 			}
@@ -257,4 +256,26 @@ func fillin(obj interface{}, data map[string]interface{}) error { // {{{
 	}
 
 	return nil
+} // }}}
+
+//格式化科学法表示的数字
+func ConvertFloat(r interface{}) interface{} { // {{{
+	switch val := r.(type) {
+	case map[string]interface{}:
+		s := map[string]interface{}{}
+		for k, v := range val {
+			s[k] = ConvertFloat(v)
+		}
+		return s
+	case []interface{}:
+		s := []interface{}{}
+		for _, v := range val {
+			s = append(s, ConvertFloat(v))
+		}
+		return s
+	case float64:
+		return int(val)
+	default:
+		return r
+	}
 } // }}}
